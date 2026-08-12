@@ -144,6 +144,7 @@ pub fn run(args: BootArgs) -> Result<()> {
             args.bind,
         );
 
+        let domains = args.domain_list();
         let context = move |auth: AuthMode| Context {
             auth,
             bind: args.bind,
@@ -153,6 +154,7 @@ pub fn run(args: BootArgs) -> Result<()> {
                 args.cidr,
                 args.cidr_range,
                 args.fallback,
+                domains.clone(),
                 args.connect_timeout,
                 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
                 args.tcp_user_timeout,

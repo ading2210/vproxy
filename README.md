@@ -219,6 +219,26 @@ Append `-session-id` to the username, where session is a fixed value and ID is a
 
 Append `-range-id` to the username, where range is a fixed value and ID is any random value (e.g. `username-range-123456`). By keeping the Range ID unchanged, you can use a fixed CIDR range in a fixed range. in addition, you must set the startup parameter `--cidr-range`, and the length is within a valid range.
 
+### Domain Split Tunneling
+
+With a domain whitelist, only whitelisted hosts are routed through the randomized
+CIDR-sourced source IP; all other traffic uses the default interface. Entries cover
+subdomains and match case-insensitively (`example.com` matches `api.example.com`,
+not `notexample.com`). Without a whitelist, all traffic uses the CIDR as before.
+
+```bash
+# Inline (repeatable / comma-separated)
+vproxy run -i 2001:470:e953::/48 \
+  --domains example.com,target-site.org socks5 -u user -p pass
+
+# From a file (one per line, '#' comments ignored)
+vproxy run -i 2001:470:e953::/48 \
+  --domain-file /etc/vproxy/domains.txt socks5 -u user -p pass
+```
+
+Applies to SOCKS5 CONNECT, HTTP/HTTPS CONNECT and forward proxies, MASQUE
+CONNECT-UDP, and SOCKS5 UDP relay datagrams.
+
 ### Examples
 
 - Http proxy session with username and password:

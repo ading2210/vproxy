@@ -27,6 +27,30 @@ pub enum Fallback {
     Interface(String),
 }
 
+/// Domains routed through the CIDR; subdomains match, unlisted hosts use the
+/// default interface.
+#[derive(Clone, Debug, Default)]
+pub struct DomainList(Vec<String>);
+
+impl DomainList {
+    pub fn new(domains: Vec<String>) -> Self {
+        Self(
+            domains
+                .into_iter()
+                .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect(),
+        )
+    }
+
+    pub fn matches(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        self.0.iter().any(|domain| {
+            host == *domain || host.strip_suffix(domain).is_some_and(|p| p.ends_with('.'))
+        })
+    }
+}
+
 /// Represents a target address for outbound connections.
 #[non_exhaustive]
 pub enum TargetAddr {
@@ -42,6 +66,7 @@ pub struct Connector {
     cidr: Option<IpCidr>,
     cidr_range: Option<u8>,
     fallback: Option<Fallback>,
+    domains: Option<DomainList>,
     connect_timeout: Duration,
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     tcp_user_timeout: Option<Duration>,
@@ -123,6 +148,7 @@ impl Connector {
         cidr: Option<IpCidr>,
         cidr_range: Option<u8>,
         fallback: Option<Fallback>,
+        domains: Option<DomainList>,
         connect_timeout: u64,
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         tcp_user_timeout: Option<u64>,
@@ -138,6 +164,7 @@ impl Connector {
             cidr,
             cidr_range,
             fallback,
+            domains,
             connect_timeout,
             #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
             tcp_user_timeout: tcp_user_timeout.map(Duration::from_secs),
@@ -177,6 +204,33 @@ impl Connector {
     pub(crate) fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
+
+    pub(crate) fn routed_for(&self, host: Option<&str>) -> bool {
+        match &self.domains {
+            Some(domains) => host.is_some_and(|host| domains.matches(host)),
+            None => true,
+        }
+    }
+
+    fn connect_mode(&self, host: Option<&str>) -> ConnectMode<'_> {
+        if !self.routed_for(host) {
+            return ConnectMode::Direct;
+        }
+        match (self.cidr, &self.fallback) {
+            (Some(cidr), Some(fallback)) => ConnectMode::CidrFallback(cidr, fallback),
+            (Some(cidr), None) => ConnectMode::Cidr(cidr),
+            (None, Some(fallback)) => ConnectMode::Fallback(fallback),
+            (None, None) => ConnectMode::Direct,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConnectMode<'a> {
+    Direct,
+    Cidr(IpCidr),
+    Fallback(&'a Fallback),
+    CidrFallback(IpCidr, &'a Fallback),
 }
 
 // ==== impl TcpConnector ====
@@ -377,33 +431,35 @@ impl TcpConnector<'_> {
     async fn connect_with_addrs(
         &self,
         addrs: impl IntoIterator<Item = SocketAddr>,
+        host: Option<&str>,
     ) -> std::io::Result<TcpStream> {
+        let mode = self.inner.connect_mode(host);
         let mut last_err = None;
         for target_addr in addrs {
-            let res = match (self.inner.cidr, &self.inner.fallback) {
-                (None, Some(fallback)) => {
-                    timeout(
-                        self.inner.connect_timeout,
-                        self.connect_with_fallback(target_addr, fallback),
-                    )
-                    .await?
+            let res = match mode {
+                ConnectMode::Direct => {
+                    timeout(self.inner.connect_timeout, TcpStream::connect(target_addr)).await?
                 }
-                (Some(cidr), None) => {
+                ConnectMode::Cidr(cidr) => {
                     timeout(
                         self.inner.connect_timeout,
                         self.connect_with_cidr(target_addr, cidr),
                     )
                     .await?
                 }
-                (Some(cidr), Some(fallback)) => {
+                ConnectMode::Fallback(fallback) => {
+                    timeout(
+                        self.inner.connect_timeout,
+                        self.connect_with_fallback(target_addr, fallback),
+                    )
+                    .await?
+                }
+                ConnectMode::CidrFallback(cidr, fallback) => {
                     timeout(
                         self.inner.connect_timeout,
                         self.connect_with_cidr_fallback(target_addr, cidr, fallback),
                     )
                     .await?
-                }
-                (None, None) => {
-                    timeout(self.inner.connect_timeout, TcpStream::connect(target_addr)).await?
                 }
             }
             .and_then(|stream| {
@@ -435,15 +491,15 @@ impl TcpConnector<'_> {
         match target_addr.into() {
             TargetAddr::SocketAddress(addr) => {
                 let addrs = std::iter::once(addr);
-                self.connect_with_addrs(addrs).await
+                self.connect_with_addrs(addrs, None).await
             }
             TargetAddr::DomainAddress(domain, port) => {
-                let addrs = lookup_host((domain, port)).await?;
-                self.connect_with_addrs(addrs).await
+                let addrs = lookup_host((domain.clone(), port)).await?;
+                self.connect_with_addrs(addrs, Some(&domain)).await
             }
             TargetAddr::Authority(authority) => {
                 let addrs = lookup_host(authority.as_str()).await?;
-                self.connect_with_addrs(addrs).await
+                self.connect_with_addrs(addrs, Some(authority.host())).await
             }
         }
     }
@@ -580,7 +636,43 @@ impl UdpConnector<'_> {
         Err(error(last_err))
     }
 
-    pub(crate) async fn connect(&self, targets: &[SocketAddr]) -> std::io::Result<UdpSocket> {
+    async fn try_connect_plain(&self, targets: &[SocketAddr]) -> std::io::Result<UdpSocket> {
+        let mut last_err = None;
+        for &target in targets {
+            let bind_ip = if target.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            };
+
+            let socket = match self.create_socket(bind_ip).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    last_err = Some(error);
+                    continue;
+                }
+            };
+
+            match socket.connect(target).await {
+                Ok(()) => {
+                    configure_udp_path(&socket)?;
+                    tracing::info!("[UDP] connected {} -> {}", socket.local_addr()?, target);
+                    return Ok(socket);
+                }
+                Err(error) => last_err = Some(error),
+            }
+        }
+        Err(error(last_err))
+    }
+
+    pub(crate) async fn connect(
+        &self,
+        host: Option<&str>,
+        targets: &[SocketAddr],
+    ) -> std::io::Result<UdpSocket> {
+        if !self.inner.routed_for(host) {
+            return self.try_connect_plain(targets).await;
+        }
         if self.inner.cidr.is_some() {
             match self.try_connect_targets(targets, true).await {
                 Ok(socket) => return Ok(socket),
@@ -602,8 +694,12 @@ impl UdpConnector<'_> {
         &self,
     ) -> std::io::Result<(UdpSocket, Option<UdpSocket>)> {
         match (self.inner.cidr, &self.inner.fallback) {
+            (Some(cidr), _) if self.inner.domains.is_some() => {
+                let preferred_socket = self.create_socket_with_cidr(cidr).await?;
+                let fallback_socket = create_default_socket().await?;
+                Ok((preferred_socket, Some(fallback_socket)))
+            }
             (Some(cidr), Some(Fallback::Address(addr))) => {
-                // Different IP families - create dual-stack sockets
                 let preferred_socket = self.create_socket_with_cidr(cidr).await?;
                 let fallback_socket = self.create_socket(*addr).await?;
                 Ok((preferred_socket, Some(fallback_socket)))
@@ -730,17 +826,21 @@ impl UdpConnector<'_> {
     ) -> std::io::Result<usize> {
         match target_addr.into() {
             TargetAddr::SocketAddress(addr) => {
+                let (preferred, fallback) =
+                    self.pick_outbound(None, preferred_outbound, fallback_outbound);
                 timeout(
                     self.inner.connect_timeout,
-                    self.send_packet_with_addr(pkt, addr, preferred_outbound, fallback_outbound),
+                    self.send_packet_with_addr(pkt, addr, preferred, fallback),
                 )
                 .await?
             }
             TargetAddr::DomainAddress(domain, port) => {
-                let addrs = lookup_host((domain, port)).await?;
+                let addrs = lookup_host((domain.clone(), port)).await?;
+                let (preferred, fallback) =
+                    self.pick_outbound(Some(&domain), preferred_outbound, fallback_outbound);
                 timeout(
                     self.inner.connect_timeout,
-                    self.send_packet_with_addrs(pkt, addrs, preferred_outbound, fallback_outbound),
+                    self.send_packet_with_addrs(pkt, addrs, preferred, fallback),
                 )
                 .await?
             }
@@ -750,6 +850,28 @@ impl UdpConnector<'_> {
             )),
         }
     }
+
+    fn pick_outbound<'a>(
+        &self,
+        host: Option<&str>,
+        preferred: &'a UdpSocket,
+        fallback: Option<&'a UdpSocket>,
+    ) -> (&'a UdpSocket, Option<&'a UdpSocket>) {
+        if self.inner.routed_for(host) {
+            (preferred, fallback)
+        } else {
+            (fallback.unwrap_or(preferred), None)
+        }
+    }
+}
+
+async fn create_default_socket() -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))).await?;
+    let socket_ref = socket2::SockRef::from(&socket);
+    if socket_ref.only_v6().unwrap_or(true) {
+        let _ = socket_ref.set_only_v6(false);
+    }
+    Ok(socket)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -790,50 +912,52 @@ impl HttpConnector<'_> {
         req: Request<Incoming>,
     ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
         let mut connector = self.inner.http.clone();
-        match (self.inner.cidr, &self.inner.fallback) {
-            (Some(cidr), Some(fallback)) => match (cidr, fallback) {
-                (IpCidr::V4(cidr), Fallback::Address(IpAddr::V6(v6))) => {
-                    let v4 =
-                        assign_ipv4_from_extension(cidr, self.inner.cidr_range, self.extension);
-                    connector.set_local_addresses(v4, *v6);
-                }
-                (IpCidr::V6(cidr), Fallback::Address(IpAddr::V4(v4))) => {
-                    let v6 =
-                        assign_ipv6_from_extension(cidr, self.inner.cidr_range, self.extension);
-                    connector.set_local_addresses(*v4, v6);
-                }
-                #[cfg(unix)]
-                (_, Fallback::Interface(iface)) => {
-                    connector.set_interface(iface);
-                }
+        if self.inner.routed_for(req.uri().host()) {
+            match (self.inner.cidr, &self.inner.fallback) {
+                (Some(cidr), Some(fallback)) => match (cidr, fallback) {
+                    (IpCidr::V4(cidr), Fallback::Address(IpAddr::V6(v6))) => {
+                        let v4 =
+                            assign_ipv4_from_extension(cidr, self.inner.cidr_range, self.extension);
+                        connector.set_local_addresses(v4, *v6);
+                    }
+                    (IpCidr::V6(cidr), Fallback::Address(IpAddr::V4(v4))) => {
+                        let v6 =
+                            assign_ipv6_from_extension(cidr, self.inner.cidr_range, self.extension);
+                        connector.set_local_addresses(*v4, v6);
+                    }
+                    #[cfg(unix)]
+                    (_, Fallback::Interface(iface)) => {
+                        connector.set_interface(iface);
+                    }
+                    _ => {}
+                },
+                (Some(cidr), None) => match cidr {
+                    IpCidr::V4(ipv4_cidr) => {
+                        let addr = assign_ipv4_from_extension(
+                            ipv4_cidr,
+                            self.inner.cidr_range,
+                            self.extension,
+                        );
+                        connector.set_local_address(Some(addr.into()));
+                    }
+                    IpCidr::V6(ipv6_cidr) => {
+                        let addr = assign_ipv6_from_extension(
+                            ipv6_cidr,
+                            self.inner.cidr_range,
+                            self.extension,
+                        );
+                        connector.set_local_address(Some(addr.into()));
+                    }
+                },
+                (None, Some(fallback)) => match fallback {
+                    Fallback::Address(addr) => connector.set_local_address(Some(*addr)),
+                    #[cfg(unix)]
+                    Fallback::Interface(iface) => {
+                        connector.set_interface(iface);
+                    }
+                },
                 _ => {}
-            },
-            (Some(cidr), None) => match cidr {
-                IpCidr::V4(ipv4_cidr) => {
-                    let addr = assign_ipv4_from_extension(
-                        ipv4_cidr,
-                        self.inner.cidr_range,
-                        self.extension,
-                    );
-                    connector.set_local_address(Some(addr.into()));
-                }
-                IpCidr::V6(ipv6_cidr) => {
-                    let addr = assign_ipv6_from_extension(
-                        ipv6_cidr,
-                        self.inner.cidr_range,
-                        self.extension,
-                    );
-                    connector.set_local_address(Some(addr.into()));
-                }
-            },
-            (None, Some(fallback)) => match fallback {
-                Fallback::Address(addr) => connector.set_local_address(Some(*addr)),
-                #[cfg(unix)]
-                Fallback::Interface(iface) => {
-                    connector.set_interface(iface);
-                }
-            },
-            _ => {}
+            }
         }
 
         connector.set_nodelay(true);
@@ -1060,11 +1184,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn domain_list_matches_exact_host_and_subdomains() {
+        let list = DomainList::new(vec!["Example.COM".to_owned(), "target-site.org".to_owned()]);
+
+        assert!(list.matches("example.com"));
+        assert!(list.matches("api.example.com"));
+        assert!(list.matches("a.b.example.com"));
+        assert!(list.matches("TARGET-SITE.ORG"));
+        assert!(list.matches("www.target-site.org"));
+        assert!(list.matches("example.com."));
+
+        assert!(!list.matches("notexample.com"));
+        assert!(!list.matches("example.org"));
+        assert!(!list.matches("example.com.evil.net"));
+        assert!(!list.matches(""));
+    }
+
+    #[test]
+    fn domain_list_normalizes_entries() {
+        let list = DomainList::new(vec![" example.com ".to_owned(), String::new()]);
+        assert!(list.matches("example.com"));
+        assert!(!list.matches("other.com"));
+    }
+
+    #[test]
+    fn routed_for_uses_domain_list_only_when_configured() {
+        let connector = Connector::new(
+            Some("2001:db8::/32".parse().expect("valid IPv6 CIDR")),
+            None,
+            None,
+            Some(DomainList::new(vec!["example.com".to_owned()])),
+            10,
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            None,
+            None,
+        );
+
+        assert!(connector.routed_for(Some("example.com")));
+        assert!(connector.routed_for(Some("api.example.com")));
+        assert!(!connector.routed_for(Some("other.org")));
+        assert!(!connector.routed_for(None));
+
+        let connector = Connector::new(
+            Some("2001:db8::/32".parse().expect("valid IPv6 CIDR")),
+            None,
+            None,
+            None,
+            10,
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            None,
+            None,
+        );
+        assert!(connector.routed_for(Some("example.com")));
+    }
+
+    #[test]
     fn udp_target_prefers_cidr_family_and_uses_fallback_for_the_other_family() {
         let connector = Connector::new(
             Some("2001:db8::1/128".parse().expect("valid IPv6 CIDR")),
             None,
             Some(Fallback::Address(Ipv4Addr::LOCALHOST.into())),
+            None,
             10,
             #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
             None,
@@ -1091,6 +1271,7 @@ mod tests {
             Some("192.0.2.1/32".parse().expect("valid IPv4 CIDR")),
             None,
             Some(Fallback::Address(Ipv4Addr::LOCALHOST.into())),
+            None,
             10,
             #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
             None,
@@ -1099,7 +1280,7 @@ mod tests {
 
         let socket = connector
             .udp(Extension::None)
-            .connect(&[target.local_addr().expect("target address")])
+            .connect(None, &[target.local_addr().expect("target address")])
             .await
             .expect("fallback connects");
         assert_eq!(

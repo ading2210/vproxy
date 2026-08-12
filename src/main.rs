@@ -22,7 +22,7 @@ use cidr::IpCidr;
 use clap::{Args, Parser, Subcommand};
 use tracing::Level;
 
-use crate::connect::Fallback;
+use crate::connect::{DomainList, Fallback};
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -200,6 +200,17 @@ pub struct BootArgs {
     #[arg(long, short, verbatim_doc_comment)]
     fallback: Option<Fallback>,
 
+    /// Domains (with subdomains) to route through the CIDR.
+    /// Other hosts connect via the default interface. Repeatable / comma-separated.
+    /// e.g. example.com,target-site.org
+    #[arg(long, value_delimiter = ',', verbatim_doc_comment)]
+    domains: Option<Vec<String>>,
+
+    /// Read the domain whitelist from a file (one per line, '#' comments ignored).
+    /// e.g. /etc/vproxy/domains.txt
+    #[arg(long, verbatim_doc_comment)]
+    domain_file: Option<PathBuf>,
+
     /// Outbound connection timeout (seconds).
     /// Applies to TCP/TLS and MASQUE DNS/UDP setup.
     /// Recommended: 5–15. Too low may fail on high latency links.
@@ -224,6 +235,31 @@ pub struct BootArgs {
 
     #[command(subcommand)]
     proxy: Proxy,
+}
+
+impl BootArgs {
+    fn domain_list(&self) -> Option<DomainList> {
+        let mut domains = self.domains.clone().unwrap_or_default();
+        if let Some(path) = &self.domain_file {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        domains.extend(line.split(',').map(|entry| entry.trim().to_owned()));
+                    }
+                }
+                Err(error) => tracing::warn!("failed to read domain file {:?}: {}", path, error),
+            }
+        }
+        if domains.is_empty() {
+            None
+        } else {
+            Some(DomainList::new(domains))
+        }
+    }
 }
 
 #[derive(Subcommand, Clone)]

@@ -447,7 +447,10 @@ where
     }
     let socket = match timeout(
         connect_timeout,
-        context.connector.udp(extension).connect(&targets),
+        context
+            .connector
+            .udp(extension)
+            .connect(Some(&target.0), &targets),
     )
     .await
     {
